@@ -1,0 +1,29 @@
+# Fichiers de données spécifiques
+data/msci_prices.csv
+
+# Fichiers Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Environnements virtuels
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# Notebooks Jupyter
+.ipynb_checkpoints
+
+# Fichiers système Mac
+.DS_Store
+
+# Fichiers IDE
+.vscode/
+.idea/
