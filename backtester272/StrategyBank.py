@@ -27,6 +27,31 @@ class EqualWeightStrategy(Strategy):
         weights = pd.Series(1 / num_assets, index=historical_data.columns)
         return weights
     
+
+class ShortEqualWeightStrategy(Strategy):
+    """
+    Stratégie qui attribue un poids négatif et égal à chaque actif.
+    """
+    @filter_with_signals
+    def get_position(self, historical_data: pd.DataFrame, current_position: pd.Series, benchmark_position: pd.Series = None) -> pd.Series:
+        """
+        Retourne une position négative avec des poids égaux pour chaque actif.
+
+        Args:
+            historical_data (pd.DataFrame): Les données historiques.
+            current_position (pd.Series): La position actuelle.
+
+        Returns:
+            pd.Series: Nouvelle position avec des poids égaux.
+        """
+        num_assets = historical_data.shape[1]
+
+        if num_assets == 0:
+            return pd.Series()
+
+        weights = pd.Series(1 / num_assets, index=historical_data.columns)
+        return - weights
+    
 class RandomStrategy(Strategy):
     """
     Stratégie qui attribue des poids aléatoires normalisés aux actifs.
@@ -248,15 +273,19 @@ class LongOnlyMomentumStrategy(EqualWeightStrategy):
 
 class LongOnlyIdiosyncraticMomentumStrategy(EqualWeightStrategy):
     
-    def __init__(self, quantile: float, benchmark: pd.Series):
+    def __init__(self, quantile: float, benchmark: pd.Series, window_size: int = 3 * 30 * 12, delta: int = 30 * 12):
         """
         :param quantile: pour sélectionner un quantile d'actifs (ex. 0.2 pour les 20% les plus attractifs)
         :param benchmark: série de prix du benchmark (indexée par date)
         :param risk_free_rate: taux sans risque (valeur constante ici)
         """
         self.quantile = quantile
+        self.window_size = window_size
         # Conversion du benchmark en rendements journaliers
         self.benchmark_returns = benchmark.pct_change().dropna()
+        self.rolling_mean_X = self.benchmark_returns.rolling(window=self.window_size).mean()
+        self.rolling_var_X = self.benchmark_returns.rolling(window=self.window_size).var()
+
 
     def signals(self, historical_data: pd.DataFrame) -> list:
         """
@@ -270,13 +299,19 @@ class LongOnlyIdiosyncraticMomentumStrategy(EqualWeightStrategy):
         
         # Définir la période de calcul du momentum idiosyncratique : de t-12 à t-2 mois
         try:
-            latest_date = historical_data.index[-1]
+            window_end = historical_data.index[-1]
         except IndexError:
             return []
-        window_start = latest_date - pd.Timedelta(days=12*30)
-        window_end = latest_date - pd.Timedelta(days=2*30)
-        month_ends = pd.date_range(start=window_start, end=window_end, freq='30D')
+        window_start = window_end - pd.Timedelta(days=12*30)
         
+        rolling_mean_Y_all = historical_data.rolling(window=self.window_size).mean()
+
+        rolling_cov_all = historical_data.rolling(window=self.window_size).cov(self.benchmark_returns)
+
+
+
+
+
         # Dictionnaire pour stocker le score de momentum idiosyncratique par actif
         momentum_scores = {}
         
@@ -342,4 +377,158 @@ class LongOnlyIdiosyncraticMomentumStrategy(EqualWeightStrategy):
             n_selected = 1  # au moins un actif
         selected_assets = sorted_scores.iloc[:n_selected]
         
+        return selected_assets.index.tolist()
+
+class LongOnlyIdiosyncraticMomentumStrategy(EqualWeightStrategy):
+    
+    def __init__(self, quantile: float, benchmark: pd.Series, window_size: int = 252 * 3, delta: int = 21 * 12):
+        """
+        :param quantile: pour sélectionner un quantile d'actifs (ex. 0.2 pour les 20% les plus attractifs)
+        :param benchmark: série de prix du benchmark (indexée par date)
+        :param window_size: taille de la fenêtre de rolling en nombre de jours (ici par défaut 36 mois approximatifs)
+        :param delta: période de calcul du momentum idiosyncratique (ici 12 mois)
+        """
+        self.quantile = quantile
+        self.window_size = window_size
+        self.delta = delta
+        # Conversion du benchmark en rendements journaliers
+        self.benchmark_returns = benchmark.pct_change().dropna()
+        # Pré-calcul des rolling mean et variance pour le benchmark
+        self.rolling_mean_X = self.benchmark_returns.rolling(window=self.window_size).mean()
+        self.rolling_var_X = self.benchmark_returns.rolling(window=self.window_size).var()
+
+    def signals(self, historical_data: pd.DataFrame) -> list:
+        """
+        historical_data : DataFrame contenant, pour chaque date (index) et pour chaque actif (colonnes),
+        les rendements journaliers. On suppose ici disposer d'au moins 36 mois de données.
+        """
+
+        returns = historical_data.pct_change().dropna()
+        # Filtrer pour conserver les dates communes aux données historiques et au benchmark
+        common_dates = returns.index.intersection(self.benchmark_returns.index)
+        
+        returns = returns.loc[common_dates]
+        benchmark_returns = self.benchmark_returns.loc[common_dates]
+        
+        # Définir la période de calcul du momentum idiosyncratique : sur les 12 derniers mois
+        try:
+            window_end = historical_data.index[-1]
+        except IndexError:
+            return []
+        window_start = window_end - pd.Timedelta(days=self.delta) 
+        
+        # Calcul vectorisé des rolling means pour tous les actifs
+        rolling_mean_Y_all = returns.rolling(window=self.window_size).mean()
+
+        # Calcul vectorisé de la covariance roulante entre chaque actif et le benchmark
+        rolling_cov_all = returns.rolling(window=self.window_size).cov(benchmark_returns)
+
+        
+        # Calcul de beta et alpha pour chaque actif et chaque date
+        # beta = rolling_cov_all / rolling_var_X, et alpha = rolling_mean_Y_all - beta * rolling_mean_X
+        beta_df = rolling_cov_all.divide(self.rolling_var_X, axis=0)
+        alpha_df = rolling_mean_Y_all - beta_df.multiply(self.rolling_mean_X, axis=0)
+        
+        # Calcul des résidus quotidiens pour chaque actif :
+        # resid = rendement observé - (alpha + beta * rendement benchmark)
+        # On profite du fait que benchmark_returns et returns sont alignés sur l'index.
+        resid_df = returns - (alpha_df + beta_df.multiply(benchmark_returns, axis=0))
+        
+        # Restreindre les résidus à la période d'intérêt (les 12 derniers mois)
+        resid_period = resid_df.loc[window_start:window_end]
+        
+        # Calcul du score idiosyncratique pour chaque actif : moyenne des résidus / écart-type des résidus
+        momentum_scores = resid_period.mean() / resid_period.std()
+        
+        # Tri décroissant des scores
+        sorted_scores = momentum_scores.sort_values(ascending=False)
+
+        # Si les scores sont tous nuls ou NaN, retourner une liste vide
+        if sorted_scores.isnull().all() or sorted_scores.eq(0).all():
+            return []
+        
+        # Sélectionner les actifs selon le quantile défini
+        n_assets = len(sorted_scores)
+        n_selected = int(np.ceil(n_assets * self.quantile))
+        if n_selected == 0:
+            n_selected = 1  # au moins un actif
+        selected_assets = sorted_scores.iloc[:n_selected]
+
+        return selected_assets.index.tolist()
+
+class MeanReverseIdiosyncraticMomentumStrategy(ShortEqualWeightStrategy):
+    
+    def __init__(self, quantile: float, benchmark: pd.Series, window_size: int = 252 * 3, delta: int = 21):
+        """
+        :param quantile: pour sélectionner un quantile d'actifs (ex. 0.2 pour les 20% les plus attractifs)
+        :param benchmark: série de prix du benchmark (indexée par date)
+        :param window_size: taille de la fenêtre de rolling en nombre de jours (ici par défaut 36 mois approximatifs)
+        :param delta: période de calcul du momentum idiosyncratique (ici 12 mois)
+        """
+        self.quantile = quantile
+        self.window_size = window_size
+        self.delta = delta
+        # Conversion du benchmark en rendements journaliers
+        self.benchmark_returns = benchmark.pct_change().dropna()
+        # Pré-calcul des rolling mean et variance pour le benchmark
+        self.rolling_mean_X = self.benchmark_returns.rolling(window=self.window_size).mean()
+        self.rolling_var_X = self.benchmark_returns.rolling(window=self.window_size).var()
+
+    def signals(self, historical_data: pd.DataFrame) -> list:
+        """
+        historical_data : DataFrame contenant, pour chaque date (index) et pour chaque actif (colonnes),
+        les rendements journaliers. On suppose ici disposer d'au moins 36 mois de données.
+        """
+
+        returns = historical_data.pct_change().dropna()
+        # Filtrer pour conserver les dates communes aux données historiques et au benchmark
+        common_dates = returns.index.intersection(self.benchmark_returns.index)
+        
+        returns = returns.loc[common_dates]
+        benchmark_returns = self.benchmark_returns.loc[common_dates]
+        
+        # Définir la période de calcul du momentum idiosyncratique : sur les 12 derniers mois
+        try:
+            window_end = historical_data.index[-1]
+        except IndexError:
+            return []
+        window_start = window_end - pd.Timedelta(days=self.delta) 
+        
+        # Calcul vectorisé des rolling means pour tous les actifs
+        rolling_mean_Y_all = returns.rolling(window=self.window_size).mean()
+
+        # Calcul vectorisé de la covariance roulante entre chaque actif et le benchmark
+        rolling_cov_all = returns.rolling(window=self.window_size).cov(benchmark_returns)
+
+        
+        # Calcul de beta et alpha pour chaque actif et chaque date
+        # beta = rolling_cov_all / rolling_var_X, et alpha = rolling_mean_Y_all - beta * rolling_mean_X
+        beta_df = rolling_cov_all.divide(self.rolling_var_X, axis=0)
+        alpha_df = rolling_mean_Y_all - beta_df.multiply(self.rolling_mean_X, axis=0)
+        
+        # Calcul des résidus quotidiens pour chaque actif :
+        # resid = rendement observé - (alpha + beta * rendement benchmark)
+        # On profite du fait que benchmark_returns et returns sont alignés sur l'index.
+        resid_df = returns - (alpha_df + beta_df.multiply(benchmark_returns, axis=0))
+        
+        # Restreindre les résidus à la période d'intérêt (les 12 derniers mois)
+        resid_period = resid_df.loc[window_start:window_end]
+        
+        # Calcul du score idiosyncratique pour chaque actif : moyenne des résidus / écart-type des résidus
+        momentum_scores = resid_period.mean() / resid_period.std()
+        
+        # Tri décroissant des scores
+        sorted_scores = momentum_scores.sort_values(ascending=False)
+
+        # Si les scores sont tous nuls ou NaN, retourner une liste vide
+        if sorted_scores.isnull().all() or sorted_scores.eq(0).all():
+            return []
+        
+        # Sélectionner les actifs selon le quantile défini
+        n_assets = len(sorted_scores)
+        n_selected = int(np.ceil(n_assets * self.quantile))
+        if n_selected == 0:
+            n_selected = 1  # au moins un actif
+        selected_assets = sorted_scores.iloc[:n_selected]
+
         return selected_assets.index.tolist()
