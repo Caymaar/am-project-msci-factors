@@ -111,7 +111,8 @@ class Backtester:
             transaction_cost: float = 0.0, 
             strategy: Strategy = None,
             macro: MacroTactical = None,
-            tactical: Tactical = None) -> Result:
+            tactical: Tactical = None,
+            name: str = None) -> Result:
         """
         Exécute le backtest sur la période spécifiée avec les paramètres donnés.
 
@@ -132,6 +133,9 @@ class Backtester:
         """
         if strategy is None:
             raise ValueError("Une stratégie doit être fournie pour exécuter le backtest.")
+        
+        if name is not None:
+            strategy.name = name
 
         if start_date is None:
             start_date = self.data.index[0]
