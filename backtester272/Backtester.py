@@ -499,7 +499,7 @@ class Backtester:
         Si la date n'est pas directement présente, on utilise la dernière date de poids disponible 
         et on calcule le drift jour par jour jusqu'à la date demandée.
         """
-        if weights is None:
+        if weights is None: 
             raise ValueError("Aucun poids de stratégie n'a été fourni.")
 
         if not isinstance(date, pd.Timestamp):

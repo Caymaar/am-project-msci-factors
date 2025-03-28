@@ -159,8 +159,60 @@ class Result:
         returns = prices.pct_change().dropna()
         excess_returns = returns - risk_free_rate / self.periods_freq(prices)
         return excess_returns.mean() / excess_returns.std() * (self.periods_freq(prices) ** 0.5)
+    
+    def compute_hit_ratio(self, performance: pd.Series, weights: pd.DataFrame):
+        """
+        Calcule le hit ratio, l'average win et l'average loss à partir de la série de performance
+        (prix en base 100) et du DataFrame de weights dont l'index contient les dates de rebalancement.
+        
+        Pour chaque période allant de la date i à la date i+1 (issues de l'intersection des dates de weights
+        et de performance), le rendement est calculé. Si ce rendement est positif, il est ajouté à wins, sinon à loses.
+        
+        Args:
+            performance (pd.Series): Série avec en index la date et en valeur le prix en base 100.
+            weights (pd.DataFrame): DataFrame avec en index les dates de rebalancement, en colonnes les tickers,
+                                    et en data les poids.
+        
+        Returns:
+            tuple: (hit_ratio, average_win, average_loss)
+                hit_ratio = nombre de gains / nombre de pertes (0 si aucune perte),
+                average_win = moyenne des rendements positifs (0 si aucun gain),
+                average_loss = moyenne des rendements négatifs (0 si aucune perte).
+        """
 
-    def get_metrics(self, performance: pd.Series = None, benchmark: pd.Series = None) -> dict:
+        if weights is None:
+            return 0, 0, 0
+        
+        # Récupérer les dates communes entre weights et performance
+        common_dates = weights.index.intersection(performance.index)
+        common_dates = common_dates.sort_values()
+        
+        # Si on n'a pas au moins 2 dates pour calculer un rendement, on renvoie 0 pour tous les metrics
+        if len(common_dates) < 2:
+            return 0, 0, 0
+        
+        wins = []
+        loses = []
+        
+        # Calculer le rendement entre chaque paire de dates successives
+        for i in range(len(common_dates) - 1):
+            date_current = common_dates[i]
+            date_next = common_dates[i + 1]
+            # Calculer le rendement sous forme de pourcentage
+            ret = (performance.loc[date_next] / performance.loc[date_current]) - 1
+            if ret > 0:
+                wins.append(ret)
+            elif ret < 0:
+                loses.append(ret)
+            # On ignore le cas ret == 0
+            
+        hit_ratio = len(wins) / len(loses) if len(loses) > 0 else 0
+        average_win = np.mean(wins) if wins else 0
+        average_loss = np.mean(loses) if loses else 0
+        
+        return hit_ratio, average_win, average_loss
+
+    def get_metrics(self, performance: pd.Series = None, benchmark: pd.Series = None, weights: pd.DataFrame = None) -> dict:
         """
         Calcule et retourne un dictionnaire des principales métriques de performance.
 
@@ -173,12 +225,17 @@ class Result:
         else:
             annualized_transactions_cost = 0
 
+        hit_ratio, average_win, average_loss = self.compute_hit_ratio(performance, weights)
+
         metrics = {
             'Performance': f"{self.perf(performance):.2%}",
             'CAGR': f"{self.cagr(performance):.2%}",
             'Volatility': f"{self.volatility(performance):.2%}",
             'Max Drawdown': f"{self.max_drawdown(performance):.2%}",
             'Sharpe Ratio': f"{self.sharpe_ratio(performance):.2f}",
+            'Hit Ratio': f"{hit_ratio:.2f}",
+            'Average Win': f"{average_win:.2%}",
+            'Average Loss': f"{average_loss:.2%}",
             'Annualized Transactions Cost': f"{annualized_transactions_cost:.2%}"
         }
 
@@ -205,16 +262,6 @@ class Result:
             performance = self.performance
         return performance / performance.cummax() - 1
 
-    def plot_dashboard(self, *other_results: 'Result') -> None:
-        """
-        Affiche un tableau de bord avec des graphiques comparant plusieurs stratégies.
-
-        Args:
-            *other_results (Result): Autres résultats de backtest à comparer.
-        """
-        # Contenu du graphique expliqué avec les commentaires existants en place.
-        pass  # La logique du code reste inchangée ici pour ne pas surcharger.
-
     def calculate_tracking_error(self, performance: pd.Series = None, benchmark: pd.Series = None) -> float:
         """
         Calcule l'erreur de suivi (tracking error) par rapport à un benchmark.
@@ -231,64 +278,6 @@ class Result:
             benchmark = self.benchmark
 
         return (performance.pct_change() - benchmark.pct_change()).dropna().std() * (self.periods_freq(performance) ** 0.5)
-
-    def compare(self, *other_results: 'Result') -> None:
-        """
-        Compare les résultats de plusieurs stratégies avec des graphiques et un tableau de métriques.
-
-        Args:
-            *other_results (Result): Autres résultats de backtest à comparer.
-        """
-        
-        results = [self] + list(other_results)
-
-        # Préparation des données
-
-        # On ajoute d'abord le benchmark classique s'il existe, puis le benchmark tactique
-        performances = (
-            ([self.benchmark] if self.benchmark is not None else [])
-            + ([self.tactical_benchmark] if self.tactical_benchmark is not None else [])
-            # Pour chaque résultat, on ajoute la performance classique
-            + [result.performance for result in results]
-            # Puis, si elle existe, la performance tactique
-            + [result.tactical_performance for result in results if result.tactical_performance is not None]
-        )
-        
-        # De même pour les métriques, en supposant que get_metrics accepte un paramètre performance
-        metrics = (
-            ([self.get_metrics(performance=self.benchmark)] if self.benchmark is not None else [])
-            + ([self.get_metrics(performance=self.tactical_benchmark, benchmark=self.benchmark)] if self.tactical_benchmark is not None else [])
-            + [result.get_metrics(benchmark=self.benchmark) for result in results]
-            + [result.get_metrics(performance=result.tactical_performance, benchmark=self.benchmark) for result in results if result.tactical_benchmark is not None]
-        )
-        
-        # Pour les drawdowns, on ajoute le calcul pour le benchmark, puis pour le benchmark tactique et les performances tactiques
-        drawdowns = (
-            ([self.calculate_drawdown(self.benchmark)] if self.benchmark is not None else [])
-            + ([self.calculate_drawdown(self.tactical_benchmark)] if self.tactical_benchmark is not None else [])
-            + [result.calculate_drawdown() for result in results]
-            + [result.calculate_drawdown(result.tactical_performance) for result in results if result.tactical_performance is not None]
-        )
-
-       
-        # Pour les rendements en pourcentage
-        returns = (
-            ([self.benchmark.pct_change().dropna()] if self.benchmark is not None else [])
-            + ([self.tactical_benchmark.pct_change().dropna()] if self.tactical_benchmark is not None else [])
-            + [result.performance.pct_change().dropna() for result in results]
-            + [result.tactical_performance.pct_change().dropna() for result in results if result.tactical_performance is not None]
-        )
-
-        # Nommage des courbes pour les graphiques
-        names = (
-            (['Benchmark'] if self.benchmark is not None else [])
-            + (['Tactical Benchmark'] if self.tactical_benchmark is not None else [])
-            + [result.name for result in results]
-            + [result.name + " Tactical" for result in results if result.tactical_performance is not None]
-        )
-        if self.benchmark is not None:
-            # Rajoute la métrique de tracking error
-            metrics[0]['Tracking Error'] = self.calculate_tracking_error(self.benchmark)
 
     def compare(self, *other_results: 'Result') -> None:
         """
@@ -316,14 +305,14 @@ class Result:
         )
         
         metrics = (
-            ([self.get_metrics(performance=self.benchmark)] if self.benchmark is not None else [])
-            + ([self.get_metrics(performance=self.tactical_benchmark, benchmark=self.benchmark)] if self.tactical_benchmark is not None else [])
-            + ([self.get_metrics(performance=self.macro_benchmark, benchmark=self.benchmark)] if self.macro_benchmark is not None else [])
-            + ([self.get_metrics(performance=self.tactical_macro_benchmark, benchmark=self.benchmark)] if self.tactical_macro_benchmark is not None else [])
-            + [result.get_metrics(benchmark=self.benchmark) for result in results]
-            + [result.get_metrics(performance=result.tactical_performance, benchmark=self.benchmark) for result in results if result.tactical_performance is not None]
-            + [result.get_metrics(benchmark=self.macro_benchmark) for result in results if hasattr(result, 'macro_benchmark') and result.macro_benchmark is not None]
-            + [result.get_metrics(performance=result.tactical_macro_performance, benchmark=self.benchmark) for result in results if hasattr(result, 'tactical_macro_benchmark') and result.tactical_macro_benchmark is not None]
+            ([self.get_metrics(performance=self.benchmark, weights=self.benchmark_weight)] if self.benchmark is not None else [])
+            + ([self.get_metrics(performance=self.tactical_benchmark, benchmark=self.benchmark, weights=self.tactical_benchmark_weight)] if self.tactical_benchmark is not None else [])
+            + ([self.get_metrics(performance=self.macro_benchmark, benchmark=self.benchmark, weights=self.macro_benchmark_weight)] if self.macro_benchmark is not None else [])
+            + ([self.get_metrics(performance=self.tactical_macro_benchmark, benchmark=self.benchmark, weights=self.tactical_macro_benchmark_weight)] if self.tactical_macro_benchmark is not None else [])
+            + [result.get_metrics(benchmark=self.benchmark, weights=result.weights) for result in results]
+            + [result.get_metrics(performance=result.tactical_performance, benchmark=self.benchmark, weights=result.tactical_weight) for result in results if result.tactical_performance is not None]
+            + [result.get_metrics(benchmark=self.macro_benchmark, weights=result.macro_performance_weight) for result in results if hasattr(result, 'macro_benchmark') and result.macro_benchmark is not None]
+            + [result.get_metrics(performance=result.tactical_macro_performance, benchmark=self.benchmark, weights=result.tactical_macro_performance_weight) for result in results if hasattr(result, 'tactical_macro_benchmark') and result.tactical_macro_benchmark is not None]
         )
         
         drawdowns = (
@@ -362,8 +351,6 @@ class Result:
         if self.benchmark is not None:
             # Rajoute la métrique de tracking error pour le benchmark classique
             metrics[0]['Tracking Error'] = self.calculate_tracking_error(self.benchmark)
-        
-        # Suite du code pour afficher ou analyser les graphiques et tableaux comparatifs...
 
         # Calcul des rendements annuels (EOY Returns)
         eoy_returns = []
@@ -560,3 +547,66 @@ class Result:
 
         # Afficher la figure
         fig.show()
+
+    def gather_metrics(self, *other_results, highlight_extremes=False) -> None:
+        """
+        Compare les résultats de plusieurs stratégies avec des graphiques et un tableau de métriques.
+
+        Args:
+            *other_results (Result): Autres résultats de backtest à comparer.
+        """
+        results = [self] + list(other_results)
+
+        metrics = (
+            ([self.get_metrics(performance=self.benchmark, weights=self.benchmark_weight)] if self.benchmark is not None else [])
+            + ([self.get_metrics(performance=self.tactical_benchmark, benchmark=self.benchmark, weights=self.tactical_benchmark_weight)] if self.tactical_benchmark is not None else [])
+            + ([self.get_metrics(performance=self.macro_benchmark, benchmark=self.benchmark, weights=self.macro_benchmark_weight)] if self.macro_benchmark is not None else [])
+            + ([self.get_metrics(performance=self.tactical_macro_benchmark, benchmark=self.benchmark, weights=self.tactical_macro_benchmark_weight)] if self.tactical_macro_benchmark is not None else [])
+            + [result.get_metrics(benchmark=self.benchmark, weights=result.weights) for result in results]
+            + [result.get_metrics(performance=result.tactical_performance, benchmark=self.benchmark, weights=result.tactical_weight) for result in results if result.tactical_performance is not None]
+            + [result.get_metrics(benchmark=self.macro_benchmark, weights=result.macro_performance_weight) for result in results if hasattr(result, 'macro_benchmark') and result.macro_benchmark is not None]
+            + [result.get_metrics(performance=result.tactical_macro_performance, benchmark=self.benchmark, weights=result.tactical_macro_performance_weight) for result in results if hasattr(result, 'tactical_macro_benchmark') and result.tactical_macro_benchmark is not None]
+        )
+        
+        names = (
+            (['Benchmark'] if self.benchmark is not None else [])
+            + (['Tactical Benchmark'] if self.tactical_benchmark is not None else [])
+            + (['Macro Benchmark'] if self.macro_benchmark is not None else [])
+            + (['Tactical Macro Benchmark'] if self.tactical_macro_benchmark is not None else [])
+            + [result.name for result in results]
+            + [result.name + " Tactical" for result in results if result.tactical_performance is not None]
+            + [result.name + " Macro" for result in results if hasattr(result, 'macro_performance') and result.macro_performance is not None]
+            + [result.name + " Tactical Macro" for result in results if hasattr(result, 'tactical_macro_performance') and result.tactical_macro_performance is not None]
+        )
+
+        if self.benchmark is not None:
+            # Rajoute la métrique de tracking error pour le benchmark classique
+            metrics[0]['Tracking Error'] = "0.00%"
+    
+                
+        # Création d'un DataFrame pour les métriques
+        metrics_df = pd.DataFrame(metrics)
+        metrics_df.index = names
+        metrics_df.drop(columns=['Annualized Transactions Cost'], inplace=True)
+
+        if highlight_extremes:
+            def highlight_extremes_higher_better(s):
+                is_max = s == s.max()
+                is_min = s == s.min()
+                return ['background-color: green' if v else 'background-color: red' if w else '' for v, w in zip(is_max, is_min)]
+
+            def highlight_extremes_lower_better(s):
+                is_max = s == s.max()
+                is_min = s == s.min()
+                return ['background-color: red' if v else 'background-color: green' if w else '' for v, w in zip(is_max, is_min)]
+
+            # Appliquer les deux styles en une seule chaîne
+            styled_metrics_df = (metrics_df.style
+                .apply(highlight_extremes_higher_better, subset=['Performance', 'CAGR', 'Sharpe Ratio', 'Hit Ratio', 'Average Win'], axis=0)
+                .apply(highlight_extremes_lower_better, subset=['Volatility', 'Max Drawdown', 'Average Loss'], axis=0)
+                )       
+
+            return styled_metrics_df
+        else:
+            # Affichage du DataFrame sans mise en forme
+            return metrics_df
